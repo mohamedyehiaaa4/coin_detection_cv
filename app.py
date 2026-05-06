@@ -3,7 +3,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-
 st.set_page_config(page_title="Coin Extractor", layout="wide")
 
 
@@ -28,7 +27,9 @@ def get_coin_size(radius, min_detected_radius, max_detected_radius):
     """Classify coin size relative to other coins in the same image."""
     if max_detected_radius <= min_detected_radius:
         return "Medium"
-    normalized = (radius - min_detected_radius) / (max_detected_radius - min_detected_radius)
+    normalized = (radius - min_detected_radius) / (
+        max_detected_radius - min_detected_radius
+    )
     if normalized < 1 / 3:
         return "Small"
     if normalized < 2 / 3:
@@ -36,7 +37,158 @@ def get_coin_size(radius, min_detected_radius, max_detected_radius):
     return "Large"
 
 
-def detect_coins(preprocessed_image, hough_param1=50, hough_param2=34, min_radius=10, max_radius=100):
+COIN_COLOR_PALETTE = {
+    "Silver": (192, 192, 192),
+    "Gold": (212, 175, 55),
+    "Copper": (184, 115, 51),
+    "Bronze": (205, 127, 50),
+    "Dark": (75, 75, 75),
+}
+
+
+COLOR_PROFILES = {
+    "Silver": {"kind": "neutral", "target_value": 185},
+    "Gold": {"kind": "warm", "target_hue": 22, "target_saturation": 150},
+    "Copper": {"kind": "warm", "target_hue": 9, "target_saturation": 170},
+    "Bronze": {"kind": "warm", "target_hue": 14, "target_saturation": 150},
+    "Dark": {"kind": "dark", "target_value": 65},
+}
+
+
+def rgb_to_bgr(rgb):
+    """Convert an RGB color tuple to OpenCV's BGR order."""
+    red, green, blue = rgb
+    return blue, green, red
+
+
+def hue_distance(hue_a, hue_b):
+    """Return circular OpenCV HSV hue distance on the 0..179 scale."""
+    distance = abs(float(hue_a) - float(hue_b))
+    return min(distance, 180.0 - distance)
+
+
+def circular_median_hue(hues):
+    """Estimate representative hue for sampled HSV pixels."""
+    if len(hues) == 0:
+        return 0.0
+    radians = hues.astype(float) * 2.0 * np.pi / 180.0
+    mean_angle = np.arctan2(np.mean(np.sin(radians)), np.mean(np.cos(radians)))
+    return float((mean_angle * 180.0 / (2.0 * np.pi)) % 180.0)
+
+
+def palette_lab_chroma(rgb):
+    """Return LAB a/b chroma coordinates for an RGB palette color."""
+    palette_bgr = np.uint8([[rgb_to_bgr(rgb)]])
+    lab = cv2.cvtColor(palette_bgr, cv2.COLOR_BGR2LAB)[0, 0].astype(float)
+    return lab[1] - 128.0, lab[2] - 128.0
+
+
+def get_coin_color_sample(image, x, y, radius):
+    """Sample stable interior coin pixels while ignoring rims and strong glare/shadow."""
+    h, w = image.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    sample_radius = max(1, int(radius * 0.70))
+    cv2.circle(mask, (int(x), int(y)), sample_radius, 255, -1)
+
+    sampled_pixels = image[mask == 255]
+    if sampled_pixels.size == 0:
+        return None
+
+    hsv_pixels = cv2.cvtColor(
+        sampled_pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV
+    ).reshape(-1, 3)
+    value_channel = hsv_pixels[:, 2]
+    low_value, high_value = np.percentile(value_channel, [15, 90])
+    stable_pixels = sampled_pixels[
+        (value_channel >= low_value) & (value_channel <= high_value)
+    ]
+    if len(stable_pixels) < 20:
+        stable_pixels = sampled_pixels
+
+    stable_hsv = cv2.cvtColor(
+        stable_pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV
+    ).reshape(-1, 3)
+    saturated_pixels = stable_pixels[stable_hsv[:, 1] >= 25]
+    hue_pixels = saturated_pixels if len(saturated_pixels) >= 20 else stable_pixels
+    hue_hsv = cv2.cvtColor(hue_pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(
+        -1, 3
+    )
+
+    median_bgr = np.median(stable_pixels, axis=0).astype(np.uint8)
+    median_rgb = median_bgr[::-1]
+    median_lab = cv2.cvtColor(np.uint8([[median_bgr]]), cv2.COLOR_BGR2LAB)[0, 0].astype(
+        float
+    )
+
+    return {
+        "median_rgb": median_rgb,
+        "median_hue": circular_median_hue(hue_hsv[:, 0]),
+        "median_saturation": float(np.median(stable_hsv[:, 1])),
+        "median_value": float(np.median(stable_hsv[:, 2])),
+        "lab_a": float(median_lab[1] - 128.0),
+        "lab_b": float(median_lab[2] - 128.0),
+        "lab_chroma": float(np.hypot(median_lab[1] - 128.0, median_lab[2] - 128.0)),
+    }
+
+
+def score_coin_color(sample, color_name, rgb):
+    """Score how well a sampled coin matches a named palette entry; lower is better."""
+    profile = COLOR_PROFILES[color_name]
+    saturation = sample["median_saturation"]
+    value = sample["median_value"]
+    chroma = sample["lab_chroma"]
+
+    if profile["kind"] == "dark":
+        return max(value - 70.0, 0.0) / 70.0 + saturation / 180.0
+
+    if profile["kind"] == "neutral":
+        return (
+            saturation / 35.0
+            + chroma / 18.0
+            + abs(value - profile["target_value"]) / 180.0
+        )
+
+    palette_a, palette_b = palette_lab_chroma(rgb)
+    hue_score = hue_distance(sample["median_hue"], profile["target_hue"]) / 18.0
+    saturation_score = abs(saturation - profile["target_saturation"]) / 170.0
+    chroma_score = (
+        np.hypot(sample["lab_a"] - palette_a, sample["lab_b"] - palette_b) / 45.0
+    )
+    neutral_penalty = max(45.0 - saturation, 0.0) / 15.0 + max(14.0 - chroma, 0.0) / 8.0
+    return hue_score + saturation_score + chroma_score + neutral_penalty
+
+
+def classify_coin_color(image, x, y, radius, palette=COIN_COLOR_PALETTE):
+    """Classify a detected coin by choosing the closest color from the given palette.
+
+    The classifier samples only the coin interior, removes extreme highlight and
+    shadow pixels, then scores each allowed palette color using hue, saturation,
+    brightness, and LAB chroma. This avoids the previous median-RGB-only behavior
+    that often treated shiny warm coins as silver or dark under uneven lighting.
+    """
+    if not palette:
+        return "Unknown", "#000000"
+
+    sample = get_coin_color_sample(image, x, y, radius)
+    if sample is None:
+        return "Unknown", "#000000"
+
+    scores = {
+        name: score_coin_color(sample, name, rgb)
+        for name, rgb in palette.items()
+        if name in COLOR_PROFILES
+    }
+    if not scores:
+        return "Unknown", "#{:02X}{:02X}{:02X}".format(*sample["median_rgb"])
+
+    best_name = min(scores, key=scores.get)
+    color_hex = "#{:02X}{:02X}{:02X}".format(*sample["median_rgb"])
+    return best_name, color_hex
+
+
+def detect_coins(
+    preprocessed_image, hough_param1=50, hough_param2=34, min_radius=10, max_radius=100
+):
     """Detect circles using multi-pass Hough + conservative fallback merge."""
 
     def edge_support_score(edges, x, y, r):
@@ -95,9 +247,9 @@ def detect_coins(preprocessed_image, hough_param1=50, hough_param2=34, min_radiu
             for kx, ky, kr, _ in kept:
                 center_dist = np.hypot(x - kx, y - ky)
                 radius_ratio_diff = abs(r - kr) / max(r, kr)
-                if (center_dist < 0.70 * min(r, kr) and radius_ratio_diff < 0.45) or overlap_ratio(
-                    (x, y, r), (kx, ky, kr)
-                ) > 0.55:
+                if (
+                    center_dist < 0.70 * min(r, kr) and radius_ratio_diff < 0.45
+                ) or overlap_ratio((x, y, r), (kx, ky, kr)) > 0.55:
                     duplicate = True
                     break
             if not duplicate:
@@ -160,8 +312,12 @@ def detect_coins(preprocessed_image, hough_param1=50, hough_param2=34, min_radiu
             31,
             5,
         )
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        thresh = cv2.morphologyEx(
+            thresh, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1
+        )
+        contours, _ = cv2.findContours(
+            thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
 
         contour_candidates = []
         for cnt in contours:
@@ -199,7 +355,7 @@ def detect_coins(preprocessed_image, hough_param1=50, hough_param2=34, min_radiu
     return np.array([[x, y, r] for x, y, r, _ in accepted], dtype=np.uint16)
 
 
-def extract_features(circles):
+def extract_features(image, circles, palette=COIN_COLOR_PALETTE):
     if len(circles) == 0:
         return []
     radii = circles[:, 2].astype(float)
@@ -208,6 +364,7 @@ def extract_features(circles):
 
     coins = []
     for idx, (x, y, r) in enumerate(circles, start=1):
+        color_name, color_hex = classify_coin_color(image, x, y, r, palette)
         coins.append(
             {
                 "id": idx,
@@ -217,6 +374,8 @@ def extract_features(circles):
                 "diameter_px": int(2 * r),
                 "area_px2": int(np.pi * r**2),
                 "size": get_coin_size(r, min_r, max_r),
+                "color": color_name,
+                "sampled_color_hex": color_hex,
             }
         )
     return coins
@@ -228,8 +387,16 @@ def draw_results(image, coins):
         x, y, r = coin["center_x"], coin["center_y"], coin["radius_px"]
         cv2.circle(result, (x, y), r, (0, 255, 0), 2)
         cv2.circle(result, (x, y), 3, (0, 0, 255), -1)
-        label = f"#{coin['id']}: {coin['size']}"
-        cv2.putText(result, label, (x - 40, y - r - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+        label = f"#{coin['id']}: {coin['size']}, {coin['color']}"
+        cv2.putText(
+            result,
+            label,
+            (x - 40, y - r - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 0, 0),
+            2,
+        )
     return result
 
 
@@ -242,8 +409,19 @@ with st.sidebar:
     hough_param2 = st.slider("HOUGH_PARAM2", 18, 50, 34)
     min_radius = st.slider("Min Radius", 5, 40, 10)
     max_radius = st.slider("Max Radius", 30, 200, 100)
+    selected_color_names = st.multiselect(
+        "Color classes",
+        options=list(COIN_COLOR_PALETTE.keys()),
+        default=list(COIN_COLOR_PALETTE.keys()),
+        help="Only these labels will be used when assigning each detected coin color.",
+    )
+    selected_color_palette = {
+        name: COIN_COLOR_PALETTE[name] for name in selected_color_names
+    }
 
-uploaded_file = st.file_uploader("Choose a coin image", type=["jpg", "jpeg", "png", "bmp"])
+uploaded_file = st.file_uploader(
+    "Choose a coin image", type=["jpg", "jpeg", "png", "bmp"]
+)
 
 if uploaded_file is not None:
     original, gray, blurred = preprocess_image(uploaded_file.read())
@@ -254,7 +432,7 @@ if uploaded_file is not None:
         min_radius=min_radius,
         max_radius=max_radius,
     )
-    coins = extract_features(circles)
+    coins = extract_features(original, circles, selected_color_palette)
     result = draw_results(original, coins)
 
     c1, c2 = st.columns(2)
@@ -271,10 +449,20 @@ if uploaded_file is not None:
         df = pd.DataFrame(coins)
         st.dataframe(df, use_container_width=True)
 
-        size_counts = df["size"].value_counts().reset_index()
-        size_counts.columns = ["size", "count"]
-        st.bar_chart(size_counts.set_index("size"))
+        chart_col1, chart_col2 = st.columns(2)
+        with chart_col1:
+            st.subheader("Size Counts")
+            size_counts = df["size"].value_counts().reset_index()
+            size_counts.columns = ["size", "count"]
+            st.bar_chart(size_counts.set_index("size"))
+        with chart_col2:
+            st.subheader("Color Counts")
+            color_counts = df["color"].value_counts().reset_index()
+            color_counts.columns = ["color", "count"]
+            st.bar_chart(color_counts.set_index("color"))
     else:
-        st.warning("No coins detected. Try lowering HOUGH_PARAM2 or adjusting radius bounds.")
+        st.warning(
+            "No coins detected. Try lowering HOUGH_PARAM2 or adjusting radius bounds."
+        )
 else:
     st.info("Upload an image to begin.")
